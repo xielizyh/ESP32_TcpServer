@@ -29,9 +29,9 @@
 #include <lwip/netdb.h>
 
 /* Private constants ---------------------------------------------------------*/
-#define AP_WIFI_SSID        "ESP32_AP"
-#define AP_WIFI_PASS        ""
-#define AP_MAX_CONN_STA     3
+#define AP_WIFI_SSID                        "ESP32_AP"
+#define AP_WIFI_PASS                        ""
+#define AP_MAX_CONN_STA                     1
 
 #define TCP_SERVER_TASK_STK_SIZE            2048
 #define TCP_SERVER_TASK_PRIO                7
@@ -48,12 +48,12 @@
 /* Private typedef -----------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 static EventGroupHandle_t wifi_event_group;
-static TaskHandle_t app_tcp_server_task_handler;
-static TaskHandle_t _process_client_task_handler;
+static TaskHandle_t app_tcp_server_single_conn_task_handler;
+static TaskHandle_t app_tcp_server_multi_conn_task_handler;
 
 /* Private function ----------------------------------------------------------*/
-static void app_tcp_server_task(void *arg);
-static void _process_client_task(void *arg);
+static void app_tcp_server_single_conn_task(void *arg);
+static void app_tcp_server_multi_conn_task(void *arg);
 
 /**=============================================================================
  * @brief           WiFi事件回调
@@ -126,13 +126,23 @@ void app_main(void)
     ESP_ERROR_CHECK( nvs_flash_init() );
     _wifi_init_ap();
 
-    xTaskCreate((TaskFunction_t )app_tcp_server_task,
+#if 0
+    xTaskCreate((TaskFunction_t )app_tcp_server_single_conn_task,
                 (const char*    )"app_tcp_server_task",
                 (uint16_t       )TCP_SERVER_TASK_STK_SIZE,
                 (void*          )NULL,
                 (UBaseType_t    )TCP_SERVER_TASK_PRIO,
-                (TaskHandle_t*  )&app_tcp_server_task_handler);
+                (TaskHandle_t*  )&app_tcp_server_single_conn_task_handler);
 
+#else
+    xTaskCreate((TaskFunction_t )app_tcp_server_multi_conn_task,
+                (const char*    )"app_tcp_server_multi_conn_task",
+                (uint16_t       )TCP_SERVER_TASK_STK_SIZE,
+                (void*          )NULL,
+                (UBaseType_t    )TCP_SERVER_TASK_PRIO,
+                (TaskHandle_t*  )&app_tcp_server_multi_conn_task_handler);                
+
+#endif
 }
 
 
@@ -145,7 +155,7 @@ void app_main(void)
  *
  * @return          none
  *============================================================================*/
-static void app_tcp_server_task(void *arg)
+static void app_tcp_server_single_conn_task(void *arg)
 {
     struct sockaddr_in serv_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -170,13 +180,14 @@ static void app_tcp_server_task(void *arg)
     }
     ESP_LOGI(TAG_XLI, "Socket binded");
 
-    if (listen(serv_sockfd, TCP_SERVER_LISTEN_CLIENT_NUM) < 0)
+    if (listen(serv_sockfd, 1) < 0)
     {
         ESP_LOGE(TAG_XLI, "Error occured during listen: errno %d", errno);
         vTaskDelete(NULL);
     }
     ESP_LOGI(TAG_XLI, "Socket listening");
     
+    char rx_buffer[128] = {0};
     while (1)
     {
         int client_sockfd = accept(serv_sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
@@ -185,56 +196,148 @@ static void app_tcp_server_task(void *arg)
             ESP_LOGE(TAG_XLI, "Unable to accept connection: errno %d", errno);
         }
         ESP_LOGI(TAG_XLI, "A new client is connected, socket_fd=%d, addr=%s", client_sockfd, inet_ntoa(client_addr.sin_addr));
-        
-        BaseType_t res = xTaskCreate((TaskFunction_t )_process_client_task,
-                                    (const char*    )"_process_client_task",
-                                    (uint16_t       )PROCESS_CLIENT_TASK_STK_SIZE,
-                                    (void*          )client_sockfd,
-                                    (UBaseType_t    )PROCESS_CLIENT_TASK_PRIO,
-                                    (TaskHandle_t*  )&_process_client_task_handler);
-        if (res != pdPASS)
-        {
-            shutdown(client_sockfd, 0);
-            close(client_sockfd);
+
+        while (1)
+        {        
+            int len = recv(client_sockfd, rx_buffer, sizeof(rx_buffer) - 1, 0);
+            if (len < 0)
+            {
+                ESP_LOGE(TAG_XLI, "Recv failed: errno %d", errno);
+                shutdown(client_sockfd, 0);
+                close(client_sockfd);  
+                break; 
+            }
+            else if (len == 0)
+            {
+                ESP_LOGI(TAG_XLI, "Connection closed");
+                shutdown(client_sockfd, 0);
+                close(client_sockfd);   
+                break;
+            }
+            else
+            {
+                ESP_LOGI(TAG_XLI, "Received %d bytes from socket_fd %d:", len, client_sockfd);
+                ESP_LOGI(TAG_XLI, "%s", rx_buffer);
+            }
         }
     }
     
     vTaskDelete(NULL);
 }
 
+
 /**=============================================================================
- * @brief           Tcp客户端处理任务
+ * @brief           Tcp服务端并发任务
  *
  * @param[in]       arg: 任务参数指针
  *
  * @return          none
+ * 
+ * @refrence        https://blog.csdn.net/u012351051/article/details/89398683?
+ *                  depth_1-utm_source=distribute.pc_relevant.none-task&
+ *                  utm_source=distribute.pc_relevant.none-task
  *============================================================================*/
-static void _process_client_task(void *arg)
+static void app_tcp_server_multi_conn_task(void *arg)
 {
-    int client_sockfd = (int)arg;
+    struct sockaddr_in serv_addr;
+    fd_set all_set, read_set;    /*!< 定义文件句柄集合 */
+    int sockfd_max = 0; /*!< 文件句柄最大值 */
 
-    char rx_buffer[128] = {0};
+    int serv_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serv_sockfd < 0)
+    {
+        ESP_LOGE(TAG_XLI, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG_XLI, "Socket created, serv_sockfd=%d", serv_sockfd);
+
+    bzero(&serv_addr, sizeof(struct sockaddr_in));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(TCP_SERVER_PORT);
+
+    if (bind(serv_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    {
+        ESP_LOGE(TAG_XLI, "Socket unable to bind: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG_XLI, "Socket binded");
+
+    if (listen(serv_sockfd, TCP_SERVER_LISTEN_CLIENT_NUM) < 0)
+    {
+        ESP_LOGE(TAG_XLI, "Error occured during listen: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG_XLI, "Socket listening");
+    
+    FD_ZERO(&all_set);   /*!< 清空集合 */
+    FD_SET(serv_sockfd, &all_set);   /*!< 添加serv_sockfd */
+    sockfd_max = serv_sockfd;
+
     while (1)
     {
-        int len = recv(client_sockfd, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        if (len < 0)
+        read_set = all_set;
+        if (select(sockfd_max+1, &read_set, NULL, NULL, NULL) == -1)    /*!< 监听句柄集的可读性 */
         {
-            ESP_LOGE(TAG_XLI, "Recv failed: errno %d", errno);
-            break;
+            ESP_LOGE(TAG_XLI, "Sever select error");
         }
-        else if (len == 0)
+        for (int sockfd = 0; sockfd <= sockfd_max; sockfd++)    /*!< 从零开始判断 */
         {
-            ESP_LOGI(TAG_XLI, "Connection closed");
-            break;
-        }
-        else
-        {
-            ESP_LOGI(TAG_XLI, "Received %d bytes from socket_fd %d:", len, client_sockfd);
-            ESP_LOGI(TAG_XLI, "%s", rx_buffer);
+            if (!FD_ISSET(sockfd, &read_set))   /*!< sockfd在集合中状态是否变化 */
+            {
+                continue;   /*!< 跳出当前循环 */
+            }
+            if (sockfd == serv_sockfd)   /*!< 新的客户端连接 */
+            {
+                struct sockaddr_in cli_addr;
+                socklen_t cli_addr_len;
+                int cli_sockfd;
+                cli_addr_len = sizeof(cli_addr);
+                memset(&cli_addr, 0, cli_addr_len);
+                cli_sockfd = accept(serv_sockfd, (struct sockaddr *)&cli_addr, &cli_addr_len);
+                if (cli_sockfd < 0)
+                {
+                    ESP_LOGE(TAG_XLI, "Unable to accept connection: errno %d", errno);
+                }    
+                else
+                {
+                    FD_SET(cli_sockfd, &all_set);
+                    if (cli_sockfd > sockfd_max)
+                    {
+                        sockfd_max = cli_sockfd;
+                    }
+                    ESP_LOGI(TAG_XLI, "sockfd_max=%d", sockfd_max);
+                    ESP_LOGI(TAG_XLI, "A new client[cli_sockfd=%d] is connected from %s", cli_sockfd, inet_ntoa(cli_addr.sin_addr));
+                }             
+            }
+            else    /*!< 客户端的通信数据 */
+            {
+                char rx_buffer[128] = {0};
+                int len = recv(sockfd, rx_buffer, sizeof(rx_buffer) - 1, 0);
+                if (len < 0)
+                {
+                    ESP_LOGE(TAG_XLI, "Recv failed: errno %d", errno);
+                    FD_CLR(sockfd, &all_set);   /*!< 从集合中删除 */
+                    close(sockfd);
+                    ESP_LOGI(TAG_XLI, "sockfd_max=%d", sockfd_max);
+                    break;
+                }
+                else if (len == 0)
+                {
+                    ESP_LOGI(TAG_XLI, "Connection closed");
+                    FD_CLR(sockfd, &all_set);   /*!< 从集合中删除 */
+                    close(sockfd);
+                    ESP_LOGI(TAG_XLI, "sockfd_max=%d", sockfd_max);
+                    break;
+                }
+                else
+                {
+                    ESP_LOGI(TAG_XLI, "Received %d bytes from socket_fd[%d]:", len, sockfd);
+                    ESP_LOGI(TAG_XLI, "%s", rx_buffer);
+                }
+            }
         }
     }
     
-    shutdown(client_sockfd, 0);
-    close(client_sockfd);   
-    vTaskDelete(NULL); 
+    vTaskDelete(NULL);
 }
